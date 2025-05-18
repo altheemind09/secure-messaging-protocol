@@ -1,12 +1,7 @@
-;; ===========================================================================
-;; SECURE-MESSAGING-PROTOCOL - STAGE 1: CORE FUNCTIONALITY
-;; ===========================================================================
-;; Initial implementation of a decentralized blockchain messaging system
-;; with basic user registration and message exchange capabilities.
+;; SECURE-MESSAGING-PROTOCOL - STAGE 2: CONNECTION MANAGEMENT
 
-;; ===========================================================================
-;; DEFINITIONS & STATUS CODES
-;; ===========================================================================
+;; Enhanced implementation adding contact management, message categories,
+;; and more robust message lifecycle handling.
 
 ;; Status codes
 (define-constant STATUS-PARTICIPANT-UNREGISTERED u200)
@@ -14,10 +9,17 @@
 (define-constant STATUS-ACCESS-DENIED u202)
 (define-constant STATUS-COMMUNICATION-NOT-FOUND u203)
 (define-constant STATUS-CONTENT-LIMIT-EXCEEDED u204)
+(define-constant STATUS-CRYPTO-KEY-INVALID u205)
+(define-constant STATUS-PROCESS-FAILURE u206)
+(define-constant STATUS-CONNECTION-NOT-FOUND u207)
+(define-constant STATUS-CONNECTION-EXISTS u208)
+(define-constant STATUS-SELF-CONNECTION-PROHIBITED u209)
+(define-constant STATUS-COMMUNICATION-EXPIRED u210)
 
 ;; System parameters
 (define-constant CONTENT-SIZE-LIMIT u1024)
 (define-constant CRYPTO-KEY-LENGTH u33)
+(define-constant CONNECTION-LIMIT u100)
 (define-constant DEFAULT-EXPIRATION-PERIOD u1440) ;; ~10 days (10 min blocks)
 
 ;; ===========================================================================
@@ -56,9 +58,16 @@
     creation-timestamp: uint,
     confirmed: bool,
     confirmation-timestamp: (optional uint),
-    validity-block-limit: uint
+    validity-block-limit: uint,
+    category: (string-utf8 20)  ;; "normal", "private", etc.
   }
 )
+
+;; Pending communications tracker per participant
+(define-map participant-pending-items principal (list 50 uint))
+
+;; Authorized connections for each participant
+(define-map participant-network principal (list CONNECTION-LIMIT principal))
 
 ;; ===========================================================================
 ;; QUERY FUNCTIONS
@@ -97,6 +106,31 @@
   }
 )
 
+;; Retrieve pending communications for participant
+(define-read-only (fetch-participant-pending (address principal))
+  (default-to (list) (map-get? participant-pending-items address))
+)
+
+;; Get participant connections
+(define-read-only (fetch-participant-connections (address principal))
+  (default-to (list) (map-get? participant-network address))
+)
+
+;; Check if connection exists between participants
+(define-read-only (is-valid-connection (address principal) (connection principal))
+  (contains connection (fetch-participant-connections address))
+)
+
+;; Check if communication has expired
+(define-read-only (is-communication-valid (item-id uint))
+  (let (
+    (communication-data (unwrap! (fetch-communication item-id) false))
+    (current-height (unwrap-panic (get-block-info? height u0)))
+  )
+    (< current-height (get validity-block-limit communication-data))
+  )
+)
+
 ;; ===========================================================================
 ;; PUBLIC FUNCTIONS - PARTICIPANT MANAGEMENT
 ;; ===========================================================================
@@ -123,6 +157,9 @@
         last-interaction: current-time
       }
     )
+    
+    ;; Initialize empty pending items
+    (map-set participant-pending-items caller (list))
     
     ;; Update counter
     (var-set participant-counter (+ (var-get participant-counter) u1))
@@ -159,7 +196,9 @@
 
 ;; Send secure communication to another participant
 (define-public (transmit-secure-content (recipient principal) 
-                                       (encrypted-payload (buff 1024)))
+                                      (encrypted-payload (buff 1024))
+                                      (content-category (string-utf8 20))
+                                      (validity-period uint))
   (let (
     (sender tx-sender)
     (sender-profile (fetch-participant-data sender))
@@ -167,13 +206,20 @@
     (message-identifier (var-get communication-counter))
     (current-time (unwrap-panic (get-block-info? time u0)))
     (current-height (unwrap-panic (get-block-info? height u0)))
-    (expiration-height (+ current-height DEFAULT-EXPIRATION-PERIOD))
+    (expiration-height (if (> validity-period u0) 
+                       (+ current-height validity-period)
+                       (+ current-height DEFAULT-EXPIRATION-PERIOD)))
+    (recipient-pending (fetch-participant-pending recipient))
   )
     ;; Validate both participants are registered
     (asserts! (get verified sender-profile) 
               (err STATUS-PARTICIPANT-UNREGISTERED))
     (asserts! (get verified recipient-profile) 
               (err STATUS-PARTICIPANT-UNREGISTERED))
+    
+    ;; Verify connection is established
+    (asserts! (is-valid-connection sender recipient)
+              (err STATUS-ACCESS-DENIED))
     
     ;; Store the communication
     (map-set communication-store message-identifier
@@ -184,9 +230,15 @@
         creation-timestamp: current-time,
         confirmed: false,
         confirmation-timestamp: none,
-        validity-block-limit: expiration-height
+        validity-block-limit: expiration-height,
+        category: content-category
       }
     )
+    
+    ;; Update recipient's pending items
+    (map-set participant-pending-items 
+             recipient
+             (append recipient-pending message-identifier))
     
     ;; Update communication counters
     (map-set participant-registry sender
@@ -216,10 +268,16 @@
     (communication-data (unwrap! (fetch-communication item-id) 
                           (err STATUS-COMMUNICATION-NOT-FOUND)))
     (current-time (unwrap-panic (get-block-info? time u0)))
+    (current-height (unwrap-panic (get-block-info? height u0)))
+    (pending-items (fetch-participant-pending caller))
   )
     ;; Verify caller is intended recipient
     (asserts! (is-eq (get destination communication-data) caller) 
               (err STATUS-ACCESS-DENIED))
+    
+    ;; Check validity
+    (asserts! (< current-height (get validity-block-limit communication-data))
+              (err STATUS-COMMUNICATION-EXPIRED))
     
     ;; Update confirmation status
     (map-set communication-store item-id
@@ -228,6 +286,11 @@
         confirmation-timestamp: (some current-time)
       })
     )
+    
+    ;; Remove from pending items
+    (map-set participant-pending-items 
+             caller 
+             (filter non-matching-item pending-items))
     
     ;; Update activity timestamp
     (map-set participant-registry caller
@@ -238,6 +301,70 @@
     
     (ok true)
   )
+)
+
+;; Helper function for filtering items
+(define-private (non-matching-item (id uint))
+  (not (is-eq id item-id))
+)
+
+;; ===========================================================================
+;; CONNECTION MANAGEMENT
+;; ===========================================================================
+
+;; Establish new connection
+(define-public (create-connection (target-participant principal))
+  (let (
+    (caller tx-sender)
+    (caller-profile (fetch-participant-data caller))
+    (target-profile (fetch-participant-data target-participant))
+    (current-connections (fetch-participant-connections caller))
+  )
+    ;; Verify both participants are registered
+    (asserts! (get verified caller-profile) 
+              (err STATUS-PARTICIPANT-UNREGISTERED))
+    (asserts! (get verified target-profile) 
+              (err STATUS-PARTICIPANT-UNREGISTERED))
+    
+    ;; Cannot connect to self
+    (asserts! (not (is-eq caller target-participant))
+              (err STATUS-SELF-CONNECTION-PROHIBITED))
+    
+    ;; Check if connection already exists
+    (asserts! (not (is-valid-connection caller target-participant))
+              (err STATUS-CONNECTION-EXISTS))
+    
+    ;; Add connection
+    (map-set participant-network 
+             caller 
+             (append current-connections target-participant))
+    
+    (ok true)
+  )
+)
+
+;; Remove connection
+(define-public (remove-connection (target-participant principal))
+  (let (
+    (caller tx-sender)
+    (current-connections (fetch-participant-connections caller))
+  )
+    ;; Check if connection exists
+    (asserts! (is-valid-connection caller target-participant)
+              (err STATUS-CONNECTION-NOT-FOUND))
+    
+    ;; Remove connection
+    (map-set participant-network 
+             caller 
+             (filter non-matching-connection current-connections))
+    
+    (ok true)
+  )
+)
+
+;; Helper function for filtering connections
+(define-private (non-matching-connection (address principal))
+  (not (is-eq address target-participant))
 )
 
 ;; ===========================================================================
